@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import socket
 import time
 import uuid
 import os
@@ -11,7 +12,7 @@ from datetime import datetime, timezone
 
 import pydeepskylog as pds
 from PIL import Image
-from PiFinder import utils, calc_utils, config
+from PiFinder import utils, calc_utils, config, location_catalog
 from PiFinder.db.observations_db import (
     ObservationsDatabase,
 )
@@ -378,10 +379,47 @@ class Server:
                 show_new_form=show_new_form,
             )
 
+        @app.route("/locations/catalog/countries")
+        @auth_required
+        def locations_catalog_countries():
+            return jsonify({"countries": location_catalog.countries()})
+
+        @app.route("/locations/catalog/regions")
+        @auth_required
+        def locations_catalog_regions():
+            country = request.args.get("country", "")
+            return jsonify({"regions": location_catalog.regions(country)})
+
+        @app.route("/locations/catalog/districts")
+        @auth_required
+        def locations_catalog_districts():
+            country = request.args.get("country", "")
+            region = request.args.get("region", "")
+            return jsonify({"districts": location_catalog.districts(country, region)})
+
+        @app.route("/locations/catalog/places")
+        @auth_required
+        def locations_catalog_places():
+            country = request.args.get("country", "")
+            region = request.args.get("region", "")
+            district = request.args.get("district", "")
+            return jsonify(
+                {"places": location_catalog.places(country, region, district)}
+            )
+
         @app.route("/locations/add", methods=["POST"])
         @auth_required
         def location_add():
             try:
+                logger.info(
+                    "Location add request: name=%r lat=%r lon=%r altitude=%r error=%r source=%r",
+                    request.form.get("name"),
+                    request.form.get("latitude"),
+                    request.form.get("longitude"),
+                    request.form.get("altitude"),
+                    request.form.get("error_in_m"),
+                    request.form.get("source"),
+                )
                 name = request.form.get("name").strip()
                 lat = float(request.form.get("latitude"))
                 lon = float(request.form.get("longitude"))
@@ -423,6 +461,7 @@ class Server:
                 return redirect("/locations")
 
             except ValueError as e:
+                logger.warning("Location add failed validation: %s", e)
                 return app.jinja_env.get_template("locations.html").render(
                     title=_("Locations"),
                     locations=config.Config().locations.locations,
@@ -1149,6 +1188,22 @@ class Server:
                 )
             return _indi_json_response(message=success_message)
 
+        def _try_send_onstep_lx200(commands):
+            indi_cfg = _indi_config_values()
+            if indi_cfg["connection_type"] != "network" or not indi_cfg["network_host"]:
+                return False
+            try:
+                with socket.create_connection(
+                    (indi_cfg["network_host"], indi_cfg["network_port"]),
+                    timeout=2.0,
+                ) as sock:
+                    for command in commands:
+                        sock.sendall(command.encode("ascii"))
+                return True
+            except OSError as exc:
+                logger.warning("OnStep TCP motion command failed: %s", exc)
+                return False
+
         @app.route("/indi/park", methods=["POST"])
         @auth_required
         def indi_park():
@@ -1202,11 +1257,22 @@ class Server:
         @auth_required
         def indi_motion():
             direction = (request.form.get("direction") or "").strip().lower()
-            motion_map = {
-                "north": "LX200 OnStep.TELESCOPE_MOTION_NS.MOTION_NORTH=On",
-                "south": "LX200 OnStep.TELESCOPE_MOTION_NS.MOTION_SOUTH=On",
-                "west": "LX200 OnStep.TELESCOPE_MOTION_WE.MOTION_WEST=On",
-                "east": "LX200 OnStep.TELESCOPE_MOTION_WE.MOTION_EAST=On",
+            lx200_motion_map = {
+                "north": [":Mn#"],
+                "south": [":Ms#"],
+                "west": [":Mw#"],
+                "east": [":Me#"],
+                "northeast": [":Mn#", ":Me#"],
+                "northwest": [":Mn#", ":Mw#"],
+                "southeast": [":Ms#", ":Me#"],
+                "southwest": [":Ms#", ":Mw#"],
+                "stop": [":Q#"],
+            }
+            indi_motion_map = {
+                "north": ["LX200 OnStep.TELESCOPE_MOTION_NS.MOTION_NORTH=On"],
+                "south": ["LX200 OnStep.TELESCOPE_MOTION_NS.MOTION_SOUTH=On"],
+                "west": ["LX200 OnStep.TELESCOPE_MOTION_WE.MOTION_WEST=On"],
+                "east": ["LX200 OnStep.TELESCOPE_MOTION_WE.MOTION_EAST=On"],
                 "northeast": [
                     "LX200 OnStep.TELESCOPE_MOTION_NS.MOTION_NORTH=On",
                     "LX200 OnStep.TELESCOPE_MOTION_WE.MOTION_EAST=On",
@@ -1223,17 +1289,26 @@ class Server:
                     "LX200 OnStep.TELESCOPE_MOTION_NS.MOTION_SOUTH=On",
                     "LX200 OnStep.TELESCOPE_MOTION_WE.MOTION_WEST=On",
                 ],
-                "stop": "LX200 OnStep.TELESCOPE_ABORT_MOTION.ABORT=On",
+                "stop": ["LX200 OnStep.TELESCOPE_ABORT_MOTION.ABORT=On"],
             }
             try:
-                if direction not in motion_map:
+                if direction not in lx200_motion_map:
                     raise ValueError("Invalid motion command")
-                properties = motion_map[direction]
-                if isinstance(properties, str):
-                    properties = [properties]
+                if not _try_send_onstep_lx200(lx200_motion_map[direction]):
+                    result = sys_utils.apply_indi_onstep_properties(
+                        indi_motion_map[direction],
+                        server_host=_indi_config_values()["server_host"],
+                        server_port=_indi_config_values()["server_port"],
+                    )
+                    if not result["ok"]:
+                        raise RuntimeError(
+                            result.get("stderr")
+                            or result.get("stdout")
+                            or "INDI motion command failed"
+                        )
                 if request.headers.get("X-Requested-With") == "XMLHttpRequest":
-                    return _apply_indi_action_json(properties, "Motion command sent")
-                return _apply_indi_action(properties, _("Motion command sent"))
+                    return _indi_json_response(message="Motion command sent")
+                return _render_indi_page(_("Motion command sent"))
             except (RuntimeError, ValueError) as e:
                 if request.headers.get("X-Requested-With") == "XMLHttpRequest":
                     return _indi_json_response(ok=False, error=str(e))
